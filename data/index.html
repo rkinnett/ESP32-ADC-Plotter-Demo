@@ -1,0 +1,98 @@
+<!DOCTYPE HTML>
+<html>
+<head>
+
+<!-- <script src="https://canvasjs.com/assets/script/canvasjs.min.js"></script> -->
+<script type="text/javascript" src="CanvasJs"></script>
+
+<script>
+
+var running = true;
+var updateInterval = 30; // msec
+var dataLength = 20000; // number of dataPoints visible at any point
+//var baseUrl = "192.168.1.21";
+var baseUrl = window.location.hostname;
+
+window.onload = function () {
+	var xVal = 0;
+	var dps = [];
+	var chart;
+	
+	console.log("initializing chart container");
+	chart = new CanvasJS.Chart("chartContainer", {
+		title :{
+			text: "Raw Audio"
+		},
+		axisY: {
+			//includeZero: false,
+			minimum: 0,
+			maximum: 4096,
+			interval: 1024,
+			valueFormatString: "###0"
+		},      
+		data: [{
+			type: "line",
+			dataPoints: dps
+		}],
+		interactivityEnabled: false
+	});
+	
+	for(var j=0; j<dataLength-1; j++){
+		dps.push({
+			x: xVal++,
+			y: 2048
+		});
+	}
+	chart.render();
+	
+	console.log("connecting to web socket");
+	webSocket1 = new WebSocket('ws://' + baseUrl + ':81/');
+	webSocket1.binaryType = 'arraybuffer';
+	webSocket1.onmessage=function(ws){
+		//console.log('webSocket function');
+		if(running){
+			if(event.data instanceof ArrayBuffer ){
+				data = new Uint16Array(event.data);
+			} else if(typeof event.data === "string"){
+				data = event.data.split(",").map(Number);
+			}
+			
+			numSamples = data.length;
+			for(var j=0; j<numSamples-1; j++){
+				dps.push({
+					x: xVal,
+					y: data[j]
+				});
+				xVal++;
+				dps.shift();
+			}
+		}
+	};
+	
+	setInterval(function(){
+		if(running) chart.render();
+	}, updateInterval);	
+}
+	
+
+
+function toggleStartStop(){
+	if(running){
+		console.log("Stopping");
+		fetch('http://' + baseUrl + '/Stop', {mode: "no-cors"});
+		running = false;
+	} else {
+		console.log("Starting");
+		fetch('http://' + baseUrl + '/Start', {mode: "no-cors"});
+		running = true;
+	}
+}
+
+</script>
+</head>
+<body>
+<button onclick="toggleStartStop()">Start/Stop</button>
+<div id="chartContainer" style="height: 370px; width:100%;"></div>
+
+</body>
+</html>
