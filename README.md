@@ -3,4 +3,6 @@
 
 Serves an html page with dynamic CanvasJS strip chart, streaming live ADC data.
 
-Based loosely on zekageri's project:  https://github.com/zekageri/ESP32_I2S-ADC-DMA-Plotting-to-WEB
+Originally based on zekageri's project:  https://github.com/zekageri/ESP32_I2S-ADC-DMA-Plotting-to-WEB
+
+See demo here:  https://youtu.be/fNJ8EVhi6e0
