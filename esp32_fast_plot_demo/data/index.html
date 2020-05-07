@@ -4,24 +4,34 @@
 
 <!-- <script src="https://canvasjs.com/assets/script/canvasjs.min.js"></script> -->
 <script type="text/javascript" src="CanvasJs"></script>
+<!-- <script type="text/javascript" src="http://192.168.1.21/CanvasJs"></script> -->
 
 <script>
 
 var running = true;
 var updateInterval = 30; // msec
-var dataLength = 20000; // number of dataPoints visible at any point
+var dataLength = 10000; // number of dataPoints visible at any point
 //var baseUrl = "192.168.1.21";
 var baseUrl = window.location.hostname;
+var chart;
+
 
 window.onload = function () {
 	var xVal = 0;
 	var dps = [];
-	var chart;
 	
 	console.log("initializing chart container");
 	chart = new CanvasJS.Chart("chartContainer", {
 		title :{
 			text: "Raw Audio"
+		},
+		axisX:{
+			gridThickness: 0,
+			tickLength: 0,
+			lineThickness: 0,
+			labelFormatter: function(){
+				return " ";
+			}
 		},
 		axisY: {
 			//includeZero: false,
@@ -34,7 +44,9 @@ window.onload = function () {
 			type: "line",
 			dataPoints: dps
 		}],
-		interactivityEnabled: false
+		//interactivityEnabled: false
+		zoomEnabled: true, 
+		zoomType: "xy"
 	});
 	
 	for(var j=0; j<dataLength-1; j++){
@@ -49,7 +61,6 @@ window.onload = function () {
 	webSocket1 = new WebSocket('ws://' + baseUrl + ':81/');
 	webSocket1.binaryType = 'arraybuffer';
 	webSocket1.onmessage=function(ws){
-		//console.log('webSocket function');
 		if(running){
 			if(event.data instanceof ArrayBuffer ){
 				data = new Uint16Array(event.data);
@@ -85,8 +96,10 @@ function toggleStartStop(){
 		console.log("Starting");
 		fetch('http://' + baseUrl + '/Start', {mode: "no-cors"});
 		running = true;
+		// need to find a way to reset zoom level here
 	}
 }
+
 
 </script>
 </head>

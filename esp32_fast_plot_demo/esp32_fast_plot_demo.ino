@@ -10,17 +10,14 @@
 #include "SPIFFS.h"
 #include <driver/i2s.h>
 #include <driver/adc.h>
+#include "esp_task_wdt.h"
 
-// Need this to fix I2S inversion thing..
-extern "C" {
-    #include "soc/syscon_reg.h"
-    #include "soc/syscon_struct.h"
-}
 
 //SSID and Password of your WiFi router
-#include "my_wifi.h"
-//const char* ssid = "YOUR_WIFI_SSID";
-//const char* password = "YOUR_WIFI_PW";
+#include "my_wifi.h"  // this contains my ssid and pw; 
+const char* ssid = MY_WIFI_SSID;
+const char* password = MY_WIFI_PW;
+
 
 AsyncWebServer    server(80);
 WebSocketsServer  webSocket = WebSocketsServer(81);
@@ -30,24 +27,20 @@ AsyncWebSocket    ws("/test");
 
 
 /** CONFIG **/
-i2s_port_t I2S_NUM = I2S_NUM_0;   // I2S Port 
-adc1_channel_t ADC_CHANNEL = ADC1_CHANNEL_5; //GPIO33  (SET THIS FOR YOUR HARDWARE)
-const int DUMP_INTERVAL = 1;           // dump samples at this interval, msec
-const int NUM_SAMPLES = 1024;
-const int samplingFrequency = 44100;
+i2s_port_t i2s_port = I2S_NUM_0;   // I2S Port 
+adc1_channel_t adc_channel = ADC1_CHANNEL_5; //GPIO33  (SET THIS FOR YOUR HARDWARE)
+const uint16_t adc_sample_freq = 44100;
+const uint16_t dma_buffer_len = 1024;
+const uint16_t i2s_buffer_len = dma_buffer_len;
+const uint16_t ws_tx_buffer_len = dma_buffer_len;
 
 
-/** GLOBALS **/
-uint32_t collected_samples = 0;
-uint32_t last_sample_count = 0;
-uint16_t adc_reading;
 TaskHandle_t TaskHandle_2;
-int32_t  last_millis = DUMP_INTERVAL;
-long Start_Sending_Millis = 0;
-boolean streaming       = true;   // ADC enabler from web
-
-uint16_t* i2s_read_buff = (uint16_t*)calloc(NUM_SAMPLES, sizeof(uint16_t));
-uint16_t* adc_data = (uint16_t*)calloc(NUM_SAMPLES, sizeof(uint16_t));
+boolean streaming = true;
+boolean sampling  = true;
+unsigned long prev_micros;
+uint16_t* i2s_read_buff = (uint16_t*)calloc(i2s_buffer_len, sizeof(uint16_t));
+uint16_t* ws_send_buffer = (uint16_t*)calloc(ws_tx_buffer_len, sizeof(uint16_t));
 size_t bytes_read;
 
 AsyncWebSocketClient * globalClient = NULL;
@@ -55,8 +48,8 @@ AsyncWebSocketClient * globalClient = NULL;
 
 // Prototypes:
 void configure_i2s();
-static const inline void SendData();
-static const inline void Sampling();
+static const inline void sendSamples();
+static const inline void getSamples();
 void onWsEvent(AsyncWebSocket * server, AsyncWebSocketClient * client, AwsEventType type, void * arg, uint8_t *data, size_t len);
 
 
@@ -67,7 +60,7 @@ void serverons(){
       Serial.println("Error, /index.html is not onboard");
       delay(1000);
     }
-    Serial.println("trying to send index.html");
+    Serial.println("trying to send index.html");  // troubleshooting core crash if file not onboard
     AsyncWebServerResponse* response = request->beginResponse(SPIFFS, "/index.html", "text/html");
     response->addHeader("Access-Control-Max-Age", "10000");
     response->addHeader("Access-Control-Allow-Methods", "POST,GET,OPTIONS");
@@ -99,11 +92,13 @@ void serverons(){
     Serial.println("stopping stream");
     request->send(204);
     streaming = false;
+    sampling = false;
   });
   
   server.on("/Start", HTTP_GET, [](AsyncWebServerRequest * request) {
     Serial.println("starting stream");
     request->send(204);
+    sampling = true;
     streaming = true;
   });
   
@@ -155,16 +150,18 @@ void setup() {
     });
 
   ArduinoOTA.begin();
-  delay(2000);  // allow time for OTA to break in here
-
+  delay(1000);  // allow time for OTA to break in here
+  ArduinoOTA.handle();
+  
   
   server.begin();
   serverons();
   ws.onEvent(onWsEvent);
   server.addHandler(&ws);
   webSocket.begin();
-  xTaskCreatePinnedToCore ( loop0, "v_getData", 80000, NULL, 0, &TaskHandle_2, 0 );
-  Start_Sending_Millis  = millis();
+  xTaskCreatePinnedToCore(getDataLoopTask, "getDataLoopTask", 80000, NULL, 0, &TaskHandle_2, 0 );
+
+  prev_micros = micros();
 }
 
 
@@ -176,10 +173,16 @@ void loop() {
 
 
 
-static void loop0(void * pvParameters){
+static void getDataLoopTask(void * pvParameters){
   for( ;; ){
-    vTaskDelay(1);          // REQUIRED TO RESET THE WATCH DOG TIMER IF WORKFLOW DOES NOT CONTAIN ANY OTHER DELAY
-    Sampling();
+    //vTaskDelay(1);          // REQUIRED TO RESET THE WATCH DOG TIMER IF WORKFLOW DOES NOT CONTAIN ANY OTHER DELAY
+    if(sampling){
+      getSamples();
+      delayMicroseconds(100); // needed less than 1-tick (1ms) delay
+      esp_task_wdt_reset();  // reset watchdog timer
+    } else {
+      vTaskDelay(1);  // resets watchdog with 1-tick (1ms) delay
+    }
   }
 }
 
@@ -188,22 +191,21 @@ void configure_i2s(){
   i2s_config_t i2s_config = 
     {
     .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX | I2S_MODE_ADC_BUILT_IN),  // I2S receive mode with ADC
-    .sample_rate = samplingFrequency,                                             // 144000
-    .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,                                 // 16 bit I2S
-    .channel_format = I2S_CHANNEL_FMT_ALL_LEFT,                                   // all the left channel
-    .communication_format = (i2s_comm_format_t)(I2S_COMM_FORMAT_I2S | I2S_COMM_FORMAT_I2S_MSB),   // I2S format
-    .intr_alloc_flags = 0,                                                        // none
-    .dma_buf_count = 2,                                                           // number of DMA buffers 2 for fastness
-    .dma_buf_len = 1024,                                                   // number of samples
-    .use_apll = 0,                                                                // no Audio PLL
+    .sample_rate = adc_sample_freq,                                               // set I2S ADC sample rate
+    .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,                                 // 16 bit I2S (even though ADC is 12 bit)
+    .channel_format = I2S_CHANNEL_FMT_ONLY_RIGHT,                                 // handle adc data as single channel (right)
+    .communication_format = (i2s_comm_format_t)I2S_COMM_FORMAT_I2S,               // I2S format
+    .intr_alloc_flags = 0,                                                        // 
+    .dma_buf_count = 4,                                                           // number of DMA buffers >=2 for fastness
+    .dma_buf_len = dma_buffer_len,                                                // number of samples per buffer
+    .use_apll = 0,                                                                // no Audio PLL - buggy and not well documented
   };
-  adc1_config_channel_atten(ADC_CHANNEL, ADC_ATTEN_11db);
+  adc1_config_channel_atten(adc_channel, ADC_ATTEN_11db);
   adc1_config_width(ADC_WIDTH_12Bit);
-  i2s_driver_install(I2S_NUM_0, &i2s_config, 0, NULL);
+  i2s_driver_install(i2s_port, &i2s_config, 0, NULL);
  
-  i2s_set_adc_mode(ADC_UNIT_1, ADC_CHANNEL);
-  SET_PERI_REG_MASK(SYSCON_SARADC_CTRL2_REG, SYSCON_SARADC_SAR1_INV);  //fixes inversion problem
-  i2s_adc_enable(I2S_NUM_0);
+  i2s_set_adc_mode(ADC_UNIT_1, adc_channel);
+  i2s_adc_enable(i2s_port);
   vTaskDelay(1000);
 }
 
@@ -216,48 +218,44 @@ void onWsEvent(AsyncWebSocket * server, AsyncWebSocketClient * client, AwsEventT
     globalClient = client;
   } else if(type == WS_EVT_DISCONNECT){
     globalClient = NULL;
+    streaming = false;
+    sampling = false;
     Serial.println("Async_WebSocket_Disconnected");
   } else {
-    Serial.println("Async WebSocket Event: " + type);
+    Serial.println("Unhandled Async WebSocket Event");
   }
 }
 
 
 
-static const inline void SendData(){
-  String data;
-  long Millis_Now = millis();
-
-  //Serial.println("plotting");
-  if ((Millis_Now-Start_Sending_Millis) >= DUMP_INTERVAL && streaming)
-  {
-    for(int i=0; i<bytes_read/2; i++){
-      adc_data[i] = i2s_read_buff[i] & 0xFFF;
-    }
- 
-    Start_Sending_Millis = Millis_Now;
-
-    // SEND METHOD 1:  ASCII/JSON
-    /*
-    //Serial.println("sending " + String(bytes_read/2) + " samples now");
-    for(int i=0; i<bytes_read/2; i++) {
-      if(i>0) {data+=",";}
-      data += String((adc_data[i] & 0xFFF));
-    }
-    webSocket.broadcastTXT(data.c_str(), data.length());
-    Serial.println(data);
-    */
-
-    // SEND METHOD 2:  BINARY
-    webSocket.sendBIN(0, (uint8_t *)&adc_data[0], bytes_read); // sends bytes_read bytes, one byte at a time
+static const inline void sendSamples(){
+  // unsigned long micros_now = micros();    // used for troubleshooting sampling rate
+  //Serial.println(micros_now-prev_micros);  // used for troubleshooting sampling rate
+  
+  //// Per esp32.com forum topic 11023, esp32 swaps even/odd samples,
+  ////   i.g. samples 0 1 2 3 4 5 are stored as 1 0 3 2 5 4 ..
+  ////   Have to deinterleave manually...
+  //// Also need to mask upper 4 bits which contain channel info (see gitter chat between me-no-dev and bzeeman)
+  for(int i=0; i<ws_tx_buffer_len; i+=2){  // caution: this is not robust to odd buffer lens
+    ws_send_buffer[i] = i2s_read_buff[i+1] & 0x0FFF;
+    ws_send_buffer[i+1] = i2s_read_buff[i] & 0x0FFF;
+    //Serial.printf("%04X\n",ws_send_buffer[i]);
   }
+
+  // Send binary packet
+  webSocket.sendBIN(0, (uint8_t *)&ws_send_buffer[0], ws_tx_buffer_len*sizeof(uint16_t)); 
+
+  //prev_micros = micros_now;  // use for troubleshooting sampling rate
+
+  // webSockets, OTA, etc infrastructural tasks are more stable with this delay here.
+  vTaskDelay(1);  // non-blocking delay 1-tick (1ms);  beware, this can cause data dropouts if your buffer spans less than 1ms
 }
 
 
 
-static const inline void Sampling(){
-  i2s_read(I2S_NUM_0, (void*)i2s_read_buff, NUM_SAMPLES * sizeof(uint16_t), &bytes_read, portMAX_DELAY);
-   if(I2S_EVENT_RX_DONE && bytes_read>0){
-     SendData();
-   }
+static const inline void getSamples(){
+  i2s_read(i2s_port, (void*)i2s_read_buff, i2s_buffer_len*sizeof(uint16_t), &bytes_read, portMAX_DELAY);
+  if(streaming && I2S_EVENT_RX_DONE && bytes_read>0){
+    sendSamples();
+  }
 }
